@@ -1,5 +1,5 @@
 """
-app.py - FastAPI backend for Traffic Sign Recognition
+app.py - FastAPI backend for TrafficSignAI
 """
 
 import io
@@ -13,50 +13,74 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image, UnidentifiedImageError
 
-from utils import get_sign_info, preprocess_image
+# Import utils FIRST — registers MeanLayer + MaxLayer with Keras before any model load
+from utils import get_sign_info, preprocess_image, CUSTOM_OBJECTS, GENERATOR_TO_GTSRB
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global model holder
+# Use a mutable dict so lifespan can update state without `global` keyword issues
 # ─────────────────────────────────────────────────────────────────────────────
-MODEL = None
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "TrafficSignAI_Final.keras")
+_state = {"model": None, "model_file": None}
+
+
+def find_model_path() -> str | None:
+    model_dir = os.path.join(os.path.dirname(__file__), "model")
+    if not os.path.isdir(model_dir):
+        return None
+    for preferred in ["TrafficSignAI_Final.keras", "TrafficSignAI_Best.keras"]:
+        p = os.path.join(model_dir, preferred)
+        if os.path.exists(p):
+            return p
+    keras_files = sorted(f for f in os.listdir(model_dir) if f.lower().endswith(".keras"))
+    if keras_files:
+        return os.path.join(model_dir, keras_files[0])
+    h5_files = sorted(f for f in os.listdir(model_dir) if f.lower().endswith(".h5"))
+    if h5_files:
+        return os.path.join(model_dir, h5_files[0])
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lifespan – load model once on startup
+# Lifespan — load model once on startup
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global MODEL
-    try:
-        import tensorflow as tf
-        logger.info("Loading model from %s …", MODEL_PATH)
-        if not os.path.exists(MODEL_PATH):
-            logger.warning(
-                "Model file not found at %s. "
-                "Place 'TrafficSignAI_Final.keras' in the model/ directory.",
-                MODEL_PATH,
+    import keras
+
+    model_path = find_model_path()
+
+    if model_path is None:
+        logger.warning("⚠️  No .keras model found in backend/model/ — /predict will return 503")
+    else:
+        try:
+            logger.info("Loading model: %s", os.path.basename(model_path))
+            model = keras.models.load_model(
+                model_path,
+                compile=False,
+                custom_objects=CUSTOM_OBJECTS,
             )
-        else:
-            MODEL = tf.keras.models.load_model(MODEL_PATH)
-            # Warm-up pass to JIT-compile the graph
+            # Warm-up
             dummy = np.zeros((1, 224, 224, 3), dtype=np.float32)
-            MODEL.predict(dummy, verbose=0)
-            logger.info("Model loaded and warmed up successfully.")
-    except Exception as exc:
-        logger.error("Failed to load model: %s", exc)
+            model.predict(dummy, verbose=0)
+
+            _state["model"]      = model
+            _state["model_file"] = os.path.basename(model_path)
+
+            logger.info("=" * 55)
+            logger.info("✅  Model Loaded Successfully")
+            logger.info("    File   : %s", _state["model_file"])
+            logger.info("    Input  : %s", model.input_shape)
+            logger.info("    Output : %s", model.output_shape)
+            logger.info("    Classes: %d", model.output_shape[-1])
+            logger.info("=" * 55)
+        except Exception:
+            logger.exception("❌  Failed to load model")
+
     yield
-    # Cleanup (nothing needed here)
-    logger.info("Shutting down — goodbye!")
+    logger.info("Shutdown complete.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -64,19 +88,13 @@ async def lifespan(app: FastAPI):
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="TrafficSignAI API",
-    description=(
-        "REST API for classifying German Traffic Sign Recognition Benchmark (GTSRB) "
-        "images using a fine-tuned MobileNetV2 model with Triple Attention."
-    ),
+    description="Classify GTSRB traffic signs using MobileNetV2 + Triple Attention.",
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CORS – allow all origins for development / public deployment
-# ─────────────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -85,17 +103,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Allowed image MIME types
-# ─────────────────────────────────────────────────────────────────────────────
-ALLOWED_CONTENT_TYPES = {
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-    "image/bmp",
-    "image/gif",
-    "image/webp",
-    "image/tiff",
+ALLOWED_TYPES = {
+    "image/jpeg", "image/jpg", "image/png",
+    "image/bmp", "image/gif", "image/webp", "image/tiff",
 }
 
 
@@ -104,102 +114,73 @@ ALLOWED_CONTENT_TYPES = {
 # ─────────────────────────────────────────────────────────────────────────────
 @app.get("/", tags=["Health"])
 async def health_check():
-    """Health check endpoint — returns API status and whether the model is loaded."""
     return {
-        "status": "ok",
-        "message": "TrafficSignAI API is running",
-        "model_loaded": MODEL is not None,
-        "version": "1.0.0",
+        "status":       "ok",
+        "model_loaded": _state["model"] is not None,
+        "model_file":   _state["model_file"],
+        "version":      "1.0.0",
     }
 
 
 @app.post("/predict", tags=["Prediction"])
 async def predict(file: UploadFile = File(...)):
-    """
-    Predict the traffic sign class from an uploaded image.
+    model = _state["model"]
 
-    - Accepts: JPEG, PNG, BMP, GIF, WebP, TIFF
-    - Returns: class_id, traffic_sign name, confidence percentage, description, safety_tip, icon
-    """
-    # ── 1. Model availability check ──────────────────────────────────────────
-    if MODEL is None:
+    # 1. Model guard
+    if model is None:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Model is not loaded. Please ensure 'TrafficSignAI_Final.keras' "
-                "is placed in the backend/model/ directory and restart the server."
-            ),
+            detail="Model not loaded. Place a .keras file in backend/model/ and restart.",
         )
 
-    # ── 2. Content-type validation ────────────────────────────────────────────
+    # 2. File type check
     content_type = (file.content_type or "").lower()
-    if content_type not in ALLOWED_CONTENT_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type '{content_type}'. Please upload a valid image (JPEG, PNG, BMP, WebP, TIFF).",
-        )
+    if content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type '{content_type}'.")
 
-    # ── 3. Read & decode image ────────────────────────────────────────────────
+    # 3. Read + decode image
     try:
-        contents = await file.read()
-        if len(contents) == 0:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
-        image = Image.open(io.BytesIO(contents))
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Empty file.")
+        image = Image.open(io.BytesIO(data))
     except UnidentifiedImageError:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot identify the uploaded file as a valid image. Please try a different file.",
-        )
+        raise HTTPException(status_code=400, detail="Cannot identify file as a valid image.")
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("Error reading uploaded file: %s", exc)
-        raise HTTPException(status_code=400, detail=f"Error reading image: {str(exc)}")
+        raise HTTPException(status_code=400, detail=f"Error reading image: {exc}")
 
-    # ── 4. Preprocess ─────────────────────────────────────────────────────────
+    # 4. Preprocess — resize 224x224, RGB, float32, MobileNetV2 normalization
     try:
         img_array = preprocess_image(image, target_size=(224, 224))
     except Exception as exc:
-        logger.error("Preprocessing failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Image preprocessing error: {str(exc)}")
+        raise HTTPException(status_code=500, detail=f"Preprocessing error: {exc}")
 
-    # ── 5. Inference ──────────────────────────────────────────────────────────
+    # 5. Inference
     try:
-        predictions = MODEL.predict(img_array, verbose=0)  # shape (1, 43)
-        class_id = int(np.argmax(predictions[0]))
-        confidence = float(np.max(predictions[0])) * 100  # percentage
+        preds         = model.predict(img_array, verbose=0)   # shape (1, 43)
+        gen_index     = int(np.argmax(preds[0]))
+        class_id      = GENERATOR_TO_GTSRB[gen_index]         # ← correct GTSRB ID
+        confidence    = float(np.max(preds[0])) * 100
     except Exception as exc:
-        logger.error("Inference failed: %s", exc)
-        raise HTTPException(status_code=500, detail=f"Prediction error: {str(exc)}")
+        raise HTTPException(status_code=500, detail=f"Inference error: {exc}")
 
-    # ── 6. Build response ─────────────────────────────────────────────────────
-    sign_info = get_sign_info(class_id)
+    # 6. Build + return response
+    info = get_sign_info(class_id)
+    logger.info("Predict → gen=%d gtsrb=%d | %s | %.2f%%", gen_index, class_id, info["name"], confidence)
 
-    logger.info(
-        "Prediction → class_id=%d | sign='%s' | confidence=%.2f%%",
-        class_id,
-        sign_info["name"],
-        confidence,
-    )
-
-    return JSONResponse(
-        content={
-            "class_id": class_id,
-            "traffic_sign": sign_info["name"],
-            "confidence": round(confidence, 2),
-            "description": sign_info["description"],
-            "safety_tip": sign_info["safety_tip"],
-            "icon": sign_info["icon"],
-            "category": sign_info["category"],
-        }
-    )
+    return JSONResponse(content={
+        "class_id":     class_id,
+        "traffic_sign": info["name"],
+        "confidence":   round(confidence, 2),
+        "description":  info["description"],
+        "safety_tip":   info["safety_tip"],
+        "icon":         info["icon"],
+        "category":     info["category"],
+    })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dev entry-point
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
