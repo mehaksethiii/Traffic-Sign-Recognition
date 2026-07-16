@@ -122,6 +122,15 @@ async def health_check():
     }
 
 
+@app.get("/health", tags=["Health"])
+async def health():
+    return {
+        "status":       "healthy" if _state["model"] is not None else "model_not_loaded",
+        "model_loaded": _state["model"] is not None,
+        "model_file":   _state["model_file"],
+    }
+
+
 @app.post("/predict", tags=["Prediction"])
 async def predict(file: UploadFile = File(...)):
     model = _state["model"]
@@ -183,4 +192,5 @@ async def predict(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.environ.get("PORT", 7860))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
